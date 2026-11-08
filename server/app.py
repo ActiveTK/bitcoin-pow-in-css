@@ -322,7 +322,7 @@ T = {
         "site_rate": "このサイトの現在のハッシュレート", "net_rate": "世界全体のハッシュレート",
         "found": "見つかったシェア", "time": "時刻", "hash": "ハッシュ", "zeros": "先頭の0", "other": "English",
         "tweet": "ツイートする", "tweet_text": "CSSだけでBitcoinをマイニングして{k}回ハッシュ計算しました！",
-        "tweet_plain": "CSSだけでBitcoinをマイニング",
+        "tweet_plain": "CSSだけでBitcoinをマイニングしよう！！",
         "sec": "{s}秒", "min": "{m}分{s}秒", "hour": "{h}時間{m}分", "day": "{d}日", "year": "{y}年",
     },
     "en": {
