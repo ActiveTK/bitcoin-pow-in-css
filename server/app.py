@@ -18,6 +18,7 @@ import os
 import secrets
 import struct
 import time
+import urllib.parse
 from pathlib import Path
 
 from aiohttp import web
@@ -320,6 +321,8 @@ T = {
         "universe": "宇宙誕生（約138億年）をあと何回繰り返す？", "universe_v": "{x}回", "measuring": "計測中",
         "site_rate": "このサイトの現在のハッシュレート", "net_rate": "世界全体のハッシュレート",
         "found": "見つかったシェア", "time": "時刻", "hash": "ハッシュ", "zeros": "先頭の0", "other": "English",
+        "tweet": "ツイートする", "tweet_text": "CSSだけでBitcoinをマイニングして{k}回ハッシュ計算しました！",
+        "tweet_plain": "CSSだけでBitcoinをマイニング",
         "sec": "{s}秒", "min": "{m}分{s}秒", "hour": "{h}時間{m}分", "day": "{d}日", "year": "{y}年",
     },
     "en": {
@@ -332,6 +335,8 @@ T = {
         "universe": "How many more times must the universe's 13.8 billion years repeat?", "universe_v": "{x} times", "measuring": "Measuring",
         "site_rate": "This site's current hashrate", "net_rate": "Network hashrate",
         "found": "Shares found", "time": "Time (UTC)", "hash": "Hash", "zeros": "Leading zeros", "other": "日本語",
+        "tweet": "Tweet", "tweet_text": "I mined Bitcoin with nothing but CSS and computed {k} hashes!",
+        "tweet_plain": "Mining Bitcoin with nothing but CSS",
         "sec": "{s} s", "min": "{m} min {s} s", "hour": "{h} h {m} min", "day": "{d} days", "year": "{y} years",
     },
 }
@@ -380,6 +385,8 @@ def page(lang, title, body, extra_head="", site="", index=False):
 {HEAD_COMMON}
 <style>
 .stats{{height:27rem}}.stats.idle{{height:19rem}}
+.btn-x{{background:#000;color:#fff;font-weight:700}}.btn-x:hover{{background:#333;color:#fff}}
+@media (prefers-color-scheme:dark){{.btn-x{{background:#fff;color:#000}}.btn-x:hover{{background:#ddd;color:#000}}}}
 .ghr{{position:absolute;top:0;right:0;width:11rem;height:11rem;overflow:hidden;pointer-events:none;z-index:10}}
 .ghr a{{position:absolute;top:2.9rem;right:-2.6rem;width:13rem;transform:rotate(45deg);pointer-events:auto;
 background:#24292f;color:#fff;text-align:center;font-weight:700;font-size:.85rem;line-height:2.4;text-decoration:none;
@@ -546,6 +553,8 @@ async def mine(request):
                 f"<h1 class='display-5 fw-bold'>{t['title']}</h1>"
                 + par_select(lang)
                 + f"<iframe src='/stats?lang={lang}' class='stats idle w-100 border-0'></iframe>"
+                + f"<div class='my-4'><a class='btn btn-lg btn-x px-5' href='/tweet?lang={lang}' target='_blank' rel='noopener'>"
+                f"{t['tweet']}</a></div>"
                 + share_table(miner.shares, lang))
         return html_response(page(lang, t["title"], body, site=site, index=True))
 
@@ -570,8 +579,37 @@ async def mine(request):
             + live
             # 数字は小さな iframe だけを数秒ごとに読み直して更新する (採掘は止めない)
             + f"<iframe src='/stats?run=1&amp;par={par}{q}' class='stats w-100 border-0'></iframe>"
+            # 回数は押したときにサーバーが計算して、X の投稿画面へ転送する
+            + f"<div class='my-4'><a class='btn btn-lg btn-x px-5' href='/tweet?par={par}{q}' target='_blank' rel='noopener'>"
+            f"{t['tweet']}</a></div>"
             + share_table(miner.shares, lang))
     return html_response(page(lang, t["title"], body, head))
+
+
+def hashes_done(miner, sid, par):
+    """このセッションでこれまでに計算したハッシュ数の概算。検証済みの当たりの数 × 2^ビット数。
+    まだ当たりがなければ、1 コアの実測値 × 並列数 × 経過時間"""
+    ses = miner.sessions.get(sid)
+    if not ses:
+        return 0
+    if ses["proofs"]:
+        return sum(1 << b for _, b in ses["proofs"])
+    return NOMINAL_RATE * par * (time.time() - ses["start"])
+
+
+async def tweet(request):
+    miner = request.app["miner"]
+    lang = lang_of(request)
+    t = T[lang]
+    par = int_param(request.query.get("par"), PAR_CHOICES, 1)
+    k = round(hashes_done(miner, request.query.get("sid", ""), par))
+    if k > 0:
+        k_text = (f"{k:,}" if k < 10000 else big(k, lang)) if lang == "ja" else (f"{k:,}" if k < 1000000 else big(k, lang))
+        first = t["tweet_text"].format(k=k_text)
+    else:  # まだ一度も掘っていない人
+        first = t["tweet_plain"]
+    text = first + "\n" + (SITE_URL or site_url(request))
+    raise web.HTTPFound("https://x.com/intent/post?" + urllib.parse.urlencode({"text": text}))
 
 
 async def stats(request):
@@ -704,6 +742,7 @@ def make_app():
     app.router.add_get("/s/{wid}/{sl}/{x}", share_ping)
     app.router.add_get("/", mine)
     app.router.add_post("/start", start)
+    app.router.add_get("/tweet", tweet)
     app.router.add_get("/{name}", static)
     app.on_startup.append(on_startup)
     return app
