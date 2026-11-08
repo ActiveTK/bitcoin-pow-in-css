@@ -11,6 +11,8 @@ services:
       POOL_USER: 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa.css
       # a share = hash with this many leading zero bits
       SHARE_BITS: "10"
+      # absolute site URL for OGP tags (default: taken from the request)
+      # SITE_URL: https://example.com
       # parallel mode: N sandboxed iframes from different origins (one CPU core each)
       # WORKER_URL: https://worker-{i}.example.com
       # WORKERS: "8"

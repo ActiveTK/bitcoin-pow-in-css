@@ -41,6 +41,7 @@ SLICES = -(-META["rate"] * META["duration"] // (1 << L))
 WORKERS = [os.environ["WORKER_URL"].format(i=i + 1) for i in range(int(os.environ.get("WORKERS", "8")))] \
     if os.environ.get("WORKER_URL") else []
 PAR_CHOICES = (1, 2, 4, 8)
+SITE_URL = os.environ.get("SITE_URL", "").rstrip("/")  # OGP の絶対 URL。空ならリクエストのホストから作る
 GIF = bytes.fromhex("47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b")
 DIFF1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
 
@@ -160,7 +161,8 @@ class Miner:
         self.shares = []
         self.started = time.time()
         self.pages = 0
-        self.sessions = {}      # sid -> {"start": 時刻, "proofs": [(時刻, ビット数)]}
+        self.sessions = {}      # sid -> {"start": 時刻, "proofs": [(時刻, ビット数)], "shares": 数, "ip": 発行先}
+        self.credited = {}      # (wid, nonce 語) -> 時刻。数えた当たり
         self.recent = []        # サイト全体の計測用の当たり (時刻, ビット数)
         DATA.mkdir(parents=True, exist_ok=True)
         self.share_log = DATA / "shares.jsonl"
@@ -177,7 +179,7 @@ class Miner:
         en2 = (self.en2_counter % (1 << (8 * self.pool.en2_size))).to_bytes(self.pool.en2_size, "big").hex()
         header = build_header(job, self.pool.extranonce1, en2)
         wid = secrets.token_hex(6)
-        self.works[wid] = {"job": job, "en2": en2, "header": header, "created": time.time(), "bits": share_bits,
+        self.works[wid] = {"wid": wid, "job": job, "en2": en2, "header": header, "created": time.time(), "bits": share_bits,
                            # 並列数が 2 倍になるごとに計測用の当たりを 1 ビット厳しくして、1 人あたりの
                            # 通知の数を並列数によらずほぼ一定にする (CDN のレート制限にかからないように)
                            "proof_bits": min(PROOF_BITS + par.bit_length() - 1, share_bits), "sid": sid,
@@ -186,10 +188,23 @@ class Miner:
         for k in [k for k, w in self.works.items() if w["created"] < cutoff]:
             del self.works[k]
         self.pages += 1
-        self.sessions.setdefault(sid, {"start": time.time(), "proofs": [], "shares": 0})["seen"] = time.time()
+        if sid in self.sessions:
+            self.sessions[sid]["seen"] = time.time()
         for k in [k for k, v in self.sessions.items() if v["seen"] < cutoff]:
             del self.sessions[k]
+        for k in [k for k, t in self.credited.items() if t < cutoff]:
+            del self.credited[k]
         return wid, self.works[wid]
+
+    def new_session(self, ip):
+        sid = secrets.token_hex(6)
+        self.sessions[sid] = {"start": time.time(), "seen": time.time(), "proofs": [], "shares": 0, "ip": ip}
+        return sid
+
+    def session_ok(self, sid, ip):
+        """開始ボタン (POST /start) で発行し、同じ IP から使われているセッションか"""
+        ses = self.sessions.get(sid)
+        return bool(ses) and ses["ip"] == ip
 
     def session_rate(self, sid):
         """(推定ハッシュレート, 当たりの数)。当たりが少ないうちは None"""
@@ -218,14 +233,17 @@ class Miner:
         elif x.startswith("b"):
             ev["bits"].setdefault(int(x[1:-1]), set()).add(int(x[-1]))
 
-    def credit(self, work, n):
-        """計測用の当たりを n 個数える (ハッシュレートの推定に使う)。nonce を特定できなかった当たりも、
-        CSS が当たりを見つけたことは確かなので数える"""
+    def credit(self, work, nonce_word):
+        """検証済みの計測用の当たりを 1 個数える (ハッシュレートの推定に使う)。同じ nonce は二度数えない"""
+        key = (work["wid"], nonce_word)
+        if key in self.credited:
+            return False
+        self.credited[key] = time.time()
         now = time.time()
-        for _ in range(n):
-            self.recent.append((now, work["proof_bits"]))
-            if work["sid"] in self.sessions:
-                self.sessions[work["sid"]]["proofs"].append((now, work["proof_bits"]))
+        self.recent.append((now, work["proof_bits"]))
+        if work["sid"] in self.sessions:
+            self.sessions[work["sid"]]["proofs"].append((now, work["proof_bits"]))
+        return True
 
     async def verify(self, key):
         wid, sl = key
@@ -233,35 +251,23 @@ class Miner:
         work = self.works.get(wid)
         if not ev or not work:
             return
-        # 同じ区間で 2 回当たると、両方の値が届いたビットは決まらない
+        # nonce が 1 つに決まるときだけ受け付ける: 下位ビットが全部届いていて (同じ区間で 2 回当たって
+        # 両方の値が届いたビットや、キャッシュで届かなかったビットがない)、どのエンジンかの通知もあること。
+        # サーバーが候補を探すと、CSS が計算していない nonce まで数えてしまう (通知を偽造した水増しもできる)
         known = {k: next(iter(vs)) for k, vs in ev["bits"].items() if len(vs) == 1}
-        unknown = [k for k in range(L) if k not in known]
-        engines = sorted(ev["pings"]) or list(range(K))
-        # URL がキャッシュ済みだとそのビットは届かない。候補が多いと CSS が計算していない nonce まで
-        # サーバーが探すことになるので、候補が 8 個を超えるときは受け付けない
-        if (1 << len(unknown)) * len(engines) > 8:
-            log.info("ambiguous ping (unknown bits %s, engines %s): %s slice %s", unknown, engines, wid, sl)
-            self.credit(work, max(1, len(ev["pings"])))
+        if len(known) != L or not ev["pings"]:
+            log.info("ambiguous ping (bits %s, pings %s): %s slice %s", ev["bits"], ev["pings"], wid, sl)
             return
+        n = sl * (1 << L) + sum(v << k for k, v in known.items())
         hdr = bytearray(work["header"])
         found = []
-        for m in range(1 << len(unknown)):
-            low = sum(v << k for k, v in known.items())
-            for i, k in enumerate(unknown):
-                low |= ((m >> i) & 1) << k
-            n = sl * (1 << L) + low
-            for j in engines:
-                nonce_word = (K * n + j) & 0xFFFFFFFF
-                hdr[76:80] = nonce_word.to_bytes(4, "big")
-                d = dsha(bytes(hdr))
-                value = int.from_bytes(d, "little")
-                if value < (1 << (256 - work["proof_bits"])):
-                    found.append((nonce_word, d, value, len(unknown)))
-        if len(found) > max(1, len(ev["pings"])):
-            log.info("ambiguous ping (%d candidates pass): %s slice %s", len(found), wid, sl)
-            self.credit(work, max(1, len(ev["pings"])))
-            return
-        self.credit(work, len(found))
+        for j in sorted(ev["pings"]):
+            nonce_word = (K * n + j) & 0xFFFFFFFF
+            hdr[76:80] = nonce_word.to_bytes(4, "big")
+            d = dsha(bytes(hdr))
+            value = int.from_bytes(d, "little")
+            if value < (1 << (256 - work["proof_bits"])) and self.credit(work, nonce_word):
+                found.append((nonce_word, d, value, 0))
         for nonce_word, d, value, n_unknown in found:
             if value >= (1 << (256 - work["bits"])):
                 continue
@@ -305,7 +311,8 @@ HEAD_COMMON = (f'<meta name="color-scheme" content="light dark"><link rel="style
 
 T = {
     "ja": {
-        "title": "CSSだけでBitcoinをマイニングしよう！！", "connecting": "プールに接続中", "start": "開始", "stop": "停止",
+        "title": "CSSだけでBitcoinをマイニングしよう！！", "connecting": "プールに接続中",
+        "desc": "JavaScriptを使わず、CSSだけでBitcoinのProof of Work（SHA-256を2回）を計算してマイニングします。", "start": "開始", "stop": "停止",
         "par": "{n}並列", "running": "{n}並列で計算中",
         "jswarn": "JavaScriptが有効になっています。<br>インターネットはとても危険が危ないので無効にしましょう。",
         "rate": "ハッシュレート", "shares_found": "見つけたシェア", "shares_n": "{n}個", "to_share": "シェア1個まで",
@@ -316,7 +323,8 @@ T = {
         "sec": "{s}秒", "min": "{m}分{s}秒", "hour": "{h}時間{m}分", "day": "{d}日", "year": "{y}年",
     },
     "en": {
-        "title": "Bitcoin's Proof of Work, written in CSS", "connecting": "Connecting to the pool", "start": "Start", "stop": "Stop",
+        "title": "Bitcoin's Proof of Work, written in CSS", "connecting": "Connecting to the pool",
+        "desc": "Mine Bitcoin in your browser with CSS alone: the Proof of Work (double SHA-256) is computed by CSS. No JavaScript.", "start": "Start", "stop": "Stop",
         "par": "{n} cores", "par1": "1 core", "running": "Mining on {n} cores", "running1": "Mining on 1 core",
         "jswarn": "JavaScript is enabled.<br>The Internet is very dangerously dangerous, so please turn it off.",
         "rate": "Hashrate", "shares_found": "Shares found", "shares_n": "{n}", "to_share": "Time to a share",
@@ -341,13 +349,29 @@ def lang_of(request):
 NO_JS = "<!-- YES!! We have no JavaScript tag on this page!! -->\n"
 
 
-def page(lang, title, body, extra_head=""):
+def page(lang, title, body, extra_head="", site="", index=False):
+    """index=True のトップページだけを検索に載せ、OGP を付ける"""
+    t = T[lang]
+    if index:
+        meta = (f'<meta name="robots" content="all">\n<meta name="description" content="{html.escape(t["desc"])}">\n'
+                f'<link rel="canonical" href="{site}/?lang={lang}">\n'
+                f'<link rel="alternate" hreflang="ja" href="{site}/?lang=ja">\n'
+                f'<link rel="alternate" hreflang="en" href="{site}/?lang=en">\n'
+                f'<link rel="alternate" hreflang="x-default" href="{site}/">\n'
+                f'<meta property="og:type" content="website">\n<meta property="og:url" content="{site}/">\n'
+                f'<meta property="og:title" content="{html.escape(title)}">\n'
+                f'<meta property="og:description" content="{html.escape(t["desc"])}">\n'
+                f'<meta property="og:image" content="{site}/og.png">\n'
+                f'<meta property="og:locale" content="{"ja_JP" if lang == "ja" else "en_US"}">\n'
+                '<meta name="twitter:card" content="summary_large_image">\n<meta name="twitter:site" content="@ActiveTK5929">')
+    else:
+        meta = '<meta name="robots" content="noindex, nofollow">'
     return NO_JS + f"""<!doctype html>
 <html lang="{lang}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="all">
+{meta}
 <title>{title}</title>
 <link rel="icon" href="/favicon.ico" sizes="48x48">
 <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32">
@@ -453,8 +477,8 @@ def par_select(lang):
     n_max = len(WORKERS) if len(WORKERS) > 1 else 1
     opts = "".join(f"<option value='{n}'>{t.get('par1' if n == 1 else 'par', t['par']).format(n=n)}</option>"
                    for n in PAR_CHOICES if n <= n_max)
-    return ("<form action='/' method='get' class='d-flex gap-3 my-4'>"
-            f"<input type='hidden' name='run' value='1'><input type='hidden' name='lang' value='{lang}'>"
+    return ("<form action='/start' method='post' class='d-flex gap-3 my-4'>"
+            f"<input type='hidden' name='lang' value='{lang}'>"
             f"<select name='par' class='form-select form-select-lg w-auto'>{opts}</select>"
             f"<button class='btn btn-primary btn-lg px-5'>{t['start']}</button></form>")
 
@@ -475,26 +499,46 @@ def html_response(text):
                         headers={"Cache-Control": "no-store", "Vary": "Accept-Language"})
 
 
+def client_ip(request):
+    return request.headers.get("CF-Connecting-IP") or request.headers.get("X-Real-IP") or request.remote or ""
+
+
+def site_url(request):
+    return SITE_URL or f"{request.scheme}://{request.host}"
+
+
+def int_param(value, choices, default):
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return default
+    return v if v in choices else default
+
+
+async def start(request):
+    """開始ボタン (POST)。セッションを発行してから採掘ページへ。
+    採掘ページは発行済みのセッションでしか開けないので、リンクを踏ませて勝手に採掘させることはできない"""
+    miner = request.app["miner"]
+    form = await request.post()
+    lang = form.get("lang") if form.get("lang") in T else lang_of(request)
+    par = int_param(form.get("par"), [n for n in PAR_CHOICES if n <= max(1, len(WORKERS))], 1)
+    sid = miner.new_session(client_ip(request))
+    raise web.HTTPSeeOther(f"/?run=1&par={par}&sid={sid}&lang={lang}")
+
+
 async def mine(request):
     miner = request.app["miner"]
     lang = lang_of(request)
     t = T[lang]
+    site = site_url(request)
     running = request.query.get("run") == "1"
-    try:
-        bits = min(16, max(4, int(request.query.get("bits", SHARE_BITS))))
-    except ValueError:
-        bits = SHARE_BITS
-    try:
-        par = int(request.query.get("par", "1"))
-    except ValueError:
-        par = 1
-    par = par if par in PAR_CHOICES and par <= max(1, len(WORKERS)) else 1
+    par = int_param(request.query.get("par"), [n for n in PAR_CHOICES if n <= max(1, len(WORKERS))], 1)
     sid = request.query.get("sid", "")
-    if not (len(sid) == 12 and all(c in "0123456789abcdef" for c in sid)):
-        sid = secrets.token_hex(6)
     if not miner.pool.job:
         return html_response(page(lang, t["title"], f"<h1 class='fw-bold'>{t['connecting']}</h1>",
                                   '<meta http-equiv="refresh" content="10">'))
+    if running and not miner.session_ok(sid, client_ip(request)):
+        raise web.HTTPFound(f"/?lang={lang}")
     if not running:
         body = (lang_link(lang, "/")
                 + f"<div id='jswarn' class='alert alert-danger fs-4 fw-bold'>{t['jswarn']}</div>"
@@ -503,20 +547,20 @@ async def mine(request):
                 + par_select(lang)
                 + f"<iframe src='/stats?lang={lang}' class='stats idle w-100 border-0'></iframe>"
                 + share_table(miner.shares, lang))
-        return html_response(page(lang, t["title"], body))
+        return html_response(page(lang, t["title"], body, site=site, index=True))
 
-    q = f"&amp;sid={sid}&amp;lang={lang}" + (f"&amp;bits={bits}" if bits != SHARE_BITS else "")
+    q = f"&amp;sid={sid}&amp;lang={lang}"
     again = f"/?run=1&amp;par={par}{q}"
     head = f'<meta http-equiv="refresh" content="{META["refresh"]};url={again}">'
     if WORKERS:
         # 採掘は sandbox 付きの iframe で行う。オリジンごとに別のプロセスになるので、並列なら別々の CPU コアで
         # 計算でき、1 並列でも親ページ (数字の表示) が採掘に邪魔されない
         live = "".join(
-            f'<iframe sandbox src="{WORKERS[i]}/frame?bits={bits}&amp;par={par}{q}" class="border-0" style="width:7.5em;height:7rem"></iframe>'
+            f'<iframe sandbox src="{WORKERS[i]}/frame?par={par}{q}" class="border-0" style="width:7.5em;height:7rem"></iframe>'
             for i in range(par))
         live = f"<div class='d-flex flex-wrap'>{live}</div>"
     else:
-        mhead, live = engine_markup(miner, bits, sid)
+        mhead, live = engine_markup(miner, SHARE_BITS, sid, par)
         head += mhead
     head += LIVE_STYLE  # miner.css より後に置く
     body = (lang_link(lang, again.replace(f"&amp;lang={lang}", ""))
@@ -539,18 +583,14 @@ async def stats(request):
         return web.Response(text="", content_type="text/plain")
     net_rate, block_hashes = network(miner)
     if request.query.get("run") == "1":
-        try:
-            bits = min(16, max(4, int(request.query.get("bits", SHARE_BITS))))
-            par = int(request.query.get("par", "1"))
-        except ValueError:
-            bits, par = SHARE_BITS, 1
+        par = int_param(request.query.get("par"), PAR_CHOICES, 1)
         sid = request.query.get("sid", "")
         rate, _ = miner.session_rate(sid)
         ses = miner.sessions.get(sid, {})
         r = rate or NOMINAL_RATE * par
         items = [(t["rate"], fmt_rate(rate, lang) if rate else t["measuring"]),
                  (t["shares_found"], t["shares_n"].format(n=ses.get("shares", 0))),
-                 (t["to_share"], fmt_dur(2 ** bits / r, lang)),
+                 (t["to_share"], fmt_dur(2 ** SHARE_BITS / r, lang)),
                  (t["vs_net"], t["vs_net_v"].format(x=big(net_rate / r, lang)))] + block_items(r, block_hashes, lang)
         every = 3
     else:
@@ -586,23 +626,13 @@ def engine_markup(miner, bits, sid, par=1):
 
 
 async def frame(request):
-    """並列用: iframe の中で採掘するだけのページ (読み直しは親ページが行う)"""
+    """並列用: iframe の中で採掘するだけのページ (読み直しは親ページが行う)。発行済みのセッションのときだけ"""
     miner = request.app["miner"]
-    if not miner.pool.job:
-        return web.Response(text="", content_type="text/plain")
-    try:
-        bits = min(16, max(4, int(request.query.get("bits", SHARE_BITS))))
-    except ValueError:
-        bits = SHARE_BITS
     sid = request.query.get("sid", "")
-    if not (len(sid) == 12 and all(c in "0123456789abcdef" for c in sid)):
-        sid = secrets.token_hex(6)
-    try:
-        par = int(request.query.get("par", "1"))
-    except ValueError:
-        par = 1
-    par = par if par in PAR_CHOICES else 1
-    head, body = engine_markup(miner, bits, sid, par)
+    if not miner.pool.job or not miner.session_ok(sid, client_ip(request)):
+        return web.Response(text="", content_type="text/plain", status=403)
+    par = int_param(request.query.get("par"), PAR_CHOICES, 1)
+    head, body = engine_markup(miner, SHARE_BITS, sid, par)
     text = (NO_JS + f'<!doctype html><html><head><meta charset="utf-8"><meta name="color-scheme" content="light dark">{head}{LIVE_STYLE}'
             "<style>body{margin:0;font-family:monospace}"
             "@media (prefers-color-scheme:dark){#clk .eng{color:#fff}}</style></head>"
@@ -649,16 +679,22 @@ WORKER_HOSTS = {u.split("/")[2].split(":")[0] for u in WORKERS}
 
 
 @web.middleware
-async def no_index(request, handler):
-    """検索に載せるのはトップページだけ。ページの部品 (/stats, /frame, /s/ など) と並列用の作業ドメインは載せない"""
+async def headers_mw(request, handler):
     resp = await handler(request)
-    if request.path != "/" or request.host.split(":")[0] in WORKER_HOSTS:
+    # 検索に載せるのはトップページ (採掘していない状態) だけ。ページの部品 (/stats, /frame, /s/ など)、
+    # 採掘中のページ、並列用の作業ドメインは載せない
+    if (request.path != "/" or "run" in request.query or "sid" in request.query
+            or request.host.split(":")[0] in WORKER_HOSTS):
         resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    # HTML と JSON は圧縮して送る (作業ごとの CSS が入るので 1 ページ数百 KB になる)
+    if isinstance(resp, web.Response) and not isinstance(resp, web.FileResponse) \
+            and resp.content_type in ("text/html", "application/json"):
+        resp.enable_compression()
     return resp
 
 
 def make_app():
-    app = web.Application(middlewares=[no_index])
+    app = web.Application(middlewares=[headers_mw])
     app["miner"] = Miner(Pool())
     app.router.add_get("/health", health)
     app.router.add_get("/mine", mine_redirect)
@@ -667,6 +703,7 @@ def make_app():
     app.router.add_get("/shares.json", shares_json)
     app.router.add_get("/s/{wid}/{sl}/{x}", share_ping)
     app.router.add_get("/", mine)
+    app.router.add_post("/start", start)
     app.router.add_get("/{name}", static)
     app.on_startup.append(on_startup)
     return app
