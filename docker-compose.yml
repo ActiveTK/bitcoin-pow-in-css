@@ -1,0 +1,19 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # fake = local dummy pool, stratum = a real Stratum pool (POOL_HOST / POOL_PORT / POOL_USER)
+      POOL_MODE: fake
+      POOL_HOST: solo.ckpool.org
+      POOL_PORT: "3333"
+      POOL_USER: 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa.css
+      # a share = hash with this many leading zero bits
+      SHARE_BITS: "10"
+      # parallel mode: N sandboxed iframes from different origins (one CPU core each)
+      # WORKER_URL: https://worker-{i}.example.com
+      # WORKERS: "8"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

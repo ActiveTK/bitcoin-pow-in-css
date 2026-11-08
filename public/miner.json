@@ -1,0 +1,10 @@
+{
+ "k_engines": 2,
+ "rate": 40,
+ "duration": 150,
+ "refresh": 120,
+ "slice_bits": 5,
+ "css_version": "3c6d7ea48e",
+ "static_props": 7284,
+ "dynamic_props": 11947
+}
